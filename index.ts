@@ -11,11 +11,16 @@ import {
 } from '@github/dependency-submission-toolkit';
 
 import ComponentDetection from './componentDetection';
+import { retrySnapshotSubmission } from './snapshotSubmission';
 
 async function run() {
   let manifests = await ComponentDetection.scanAndGetManifests(
     core.getInput("filePath")
   );
+  if (core.getBooleanInput("fail-on-empty") &&
+      !manifests?.some((manifest) => manifest.countDependencies() > 0)) {
+    throw new Error("Component Detection found no dependencies to submit.");
+  }
   const correlatorInput =
     core.getInput("correlator")?.trim() || github.context.job;
 
@@ -72,7 +77,12 @@ async function run() {
     snapshot.ref = snapshotRef;
   }
 
-  submitSnapshot(snapshot);
+  await retrySnapshotSubmission(
+    () => submitSnapshot(snapshot),
+    core.warning
+  );
 }
 
-run();
+run().catch((error) => {
+  core.setFailed(error instanceof Error ? error.message : String(error));
+});
