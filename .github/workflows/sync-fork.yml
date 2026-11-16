@@ -29,8 +29,11 @@ jobs:
       - name: Create and Push Branch
         run: |
           git checkout -b weekly-sync-branch-${{ github.run_id }}
-          git merge upstream/main --no-commit
-          git reset -- ./.github
+          git merge upstream/main --no-commit || true
+          # Always keep this fork's .github, including when it conflicts with upstream
+          git checkout HEAD -- .github
+          git clean -fdq .github
+          if git ls-files -u | grep -q .; then echo "Unresolved conflicts outside .github"; exit 1; fi
           git commit -m "Merge upstream:main"
           git commit --allow-empty -m "Empty commit to open PR"
           git push --set-upstream origin weekly-sync-branch-${{ github.run_id }}

@@ -2,6 +2,8 @@
 
 This GitHub Action runs the [microsoft/component-detection](https://github.com/microsoft/component-detection) library to automate dependency extraction at build time. It uses a combination of static and dynamic scanning to build a dependency tree and then uploads that to GitHub's dependency graph via the dependency submission API. This gives you more accurate Dependabot alerts, and support for a bunch of additional ecosystems.
 
+The action downloads the latest Component Detection release, retrying acquisition failures twice (three attempts total), with 1-second and 2-second delays. Failed attempts are logged, including HTTP status codes for unsuccessful downloads. If acquisition still fails, the action fails without running the detector or submitting a dependency snapshot.
+
 ### Example workflows
 
 ```yaml
@@ -22,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Component detection
-        uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
+        uses: advanced-security/component-detection-dependency-submission-action@v0.2.0
 ```
 
 Additional `Experimental` and `DefaultOff`  detectors:
@@ -45,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Component detection
-        uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
+        uses: advanced-security/component-detection-dependency-submission-action@v0.2.0
         with:
           # Experimental detectors: Poetry, UvLock, NpmLockfile3, Ivy
           # Default-off detectors: ConanLock, CondaLock, Dockerfile, Pip, SimplePip, Spdx22, Swift
@@ -57,6 +59,7 @@ jobs:
 | Parameter | Description | Example |
 | --- | --- | --- |
 filePath | The path to the directory containing the environment files to upload. Defaults to Actions working directory. | `'.'`
+fail-on-empty | Fail before submitting if the scan found no resolved dependencies, even when it found an empty manifest. Defaults to `false`; set to `true` only when the scanned project is expected to have external dependencies. | `'true'`
 directoryExclusionList | Filters out specific directories following a minimatch pattern. | `test`
 detectorArgs | Comma separated list of properties that can affect the detectors execution, like EnableIfDefaultOff that allows a specific detector that is `Experimental` or `DefaultOff` to run, the format for this property is DetectorId=EnableIfDefaultOff, for example Pip=EnableIfDefaultOff. | `Pip=EnableIfDefaultOff`
 dockerImagesToScan |Comma separated list of docker image names or hashes to execute container scanning on |  ubuntu:16.04,56bab49eef2ef07505f6a1b0d5bd3a601dfc3c76ad4460f24c91d6fa298369ab |
