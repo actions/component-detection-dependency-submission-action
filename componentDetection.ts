@@ -1,59 +1,99 @@
 import * as github from '@actions/github'
 import * as core from '@actions/core'
-import { Octokit, App } from "octokit"
+import { Octokit } from "octokit"
 import {
-  PackageCache,
   BuildTarget,
   Package,
   Snapshot,
   Manifest,
   submitSnapshot,
 } from '@github/dependency-submission-toolkit'
-import fetch from 'cross-fetch'
-import tar from 'tar'
 import fs from 'fs'
 import * as exec from '@actions/exec';
 import dotenv from 'dotenv'
-import { unmockedModulePathPatterns } from './jest.config'
+import os from 'os';
 import path from 'path';
+import { 
+  EnvHttpProxyAgent, 
+  fetch as undiciFetch, 
+  type RequestInit as UndiciRequestInit, 
+  type Response as UndiciResponse 
+} from 'undici';
+
 dotenv.config();
+
+const proxyAgent = new EnvHttpProxyAgent();
+
+const formatAcquisitionError = (error: unknown, seen: Set<unknown> = new Set()): string => {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  if (seen.has(error)) {
+    return error.message;
+  }
+
+  seen.add(error);
+  return error.cause === undefined
+    ? error.message
+    : `${error.message} (caused by: ${formatAcquisitionError(error.cause, seen)})`;
+};
 
 export default class ComponentDetection {
   public static componentDetectionPath = process.platform === "win32" ? './component-detection.exe' : './component-detection';
-  public static outputPath = './output.json';
+  // Keep the scan manifest in an action-owned runner temp directory so a repository's own
+  // files are never read or deleted, and so results cannot leak between runs.
+  public static outputPath = path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'component-detection-output.json');
 
   // This is the default entry point for this class.
   static async scanAndGetManifests(path: string): Promise<Manifest[] | undefined> {
     await this.downloadLatestRelease();
-    await this.runComponentDetection(path);
-    return await this.getManifestsFromResults();
-  }
-  // Get the latest release from the component-detection repo, download the tarball, and extract it
-  public static async downloadLatestRelease() {
+    // Remove any manifest left behind by an earlier scan so a failed run cannot submit stale results.
+    fs.rmSync(this.outputPath, { force: true });
     try {
-      core.debug(`Downloading latest release for ${process.platform}`);
-      const downloadURL = await this.getLatestReleaseURL();
-      const blob = await (await fetch(new URL(downloadURL))).blob();
-      const arrayBuffer = await blob.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      await this.runComponentDetection(path);
+      return await this.getManifestsFromResults();
+    } finally {
+      fs.rmSync(this.outputPath, { force: true });
+    }
+  }
+  // Get the latest release from the component-detection repo and download its executable.
+  public static async downloadLatestRelease() {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        core.debug(`Downloading latest release for ${process.platform} (attempt ${attempt}/${maxAttempts})`);
+        const downloadURL = await this.getLatestReleaseURL();
+        const response = await this.fetchWithProxy(new URL(downloadURL));
+        if (!response.ok) {
+          try {
+            await response.body?.cancel();
+          } catch (error) {
+            core.debug(`Failed to cancel unsuccessful Component Detection response body: ${formatAcquisitionError(error)}`);
+          }
+          throw new Error(`Component Detection download failed: HTTP ${response.status} ${response.statusText} (${downloadURL})`);
+        }
+        const buffer = Buffer.from(await response.arrayBuffer());
 
-      // Write the blob to a file
-      core.debug(`Writing binary to file ${this.componentDetectionPath}`);
-      await fs.writeFileSync(this.componentDetectionPath, buffer, { mode: 0o777, flag: 'w' });
-    } catch (error: any) {
-      core.error(error);
+        core.debug(`Writing binary to file ${this.componentDetectionPath}`);
+        fs.writeFileSync(this.componentDetectionPath, buffer, { mode: 0o777, flag: 'w' });
+        return;
+      } catch (error) {
+        const message = `Component Detection acquisition failed (attempt ${attempt}/${maxAttempts}): ${formatAcquisitionError(error).replace(/\s+/g, " ").trim()}`;
+        if (attempt === maxAttempts) {
+          core.error(message);
+          throw new Error(message, { cause: error });
+        }
+        const retryDelay = 1000 * attempt;
+        core.warning(`${message}. Retrying in ${retryDelay}ms...`);
+        await new Promise((resolve) => setTimeout(() => resolve(undefined), retryDelay));
+      }
     }
   }
 
   // Run the component-detection CLI on the path specified
   public static async runComponentDetection(path: string) {
     core.info("Running component-detection");
-
-    try {
-      await exec.exec(`${this.componentDetectionPath} scan --SourceDirectory ${path} --ManifestFile ${this.outputPath} ${this.getComponentDetectionParameters()}`);
-    } catch (error: any) {
-      core.error(error);
-    }
+    await exec.exec(`${this.componentDetectionPath} scan --SourceDirectory ${path} --ManifestFile "${this.outputPath}" ${this.getComponentDetectionParameters()}`);
   }
 
   private static getComponentDetectionParameters(): string {
@@ -70,16 +110,14 @@ export default class ComponentDetection {
     core.info("Getting manifests from results");
     const results = await fs.readFileSync(this.outputPath, 'utf8');
     var json: any = JSON.parse(results);
-    let dependencyGraphs: DependencyGraphs = this.normalizeDependencyGraphPaths(json.dependencyGraphs, core.getInput('filePath'));
+    let dependencyGraphs: DependencyGraphs = this.normalizeDependencyGraphPaths(json.dependencyGraphs);
     return this.processComponentsToManifests(json.componentsFound, dependencyGraphs);
   }
 
   public static processComponentsToManifests(componentsFound: any[], dependencyGraphs: DependencyGraphs): Manifest[] {
-    // Parse the result file and add the packages to the package cache
-    const packageCache = new PackageCache();
-    const packages: Array<ComponentDetectionPackage> = [];
+    const packagesById: Map<string, ComponentDetectionPackage> = new Map();
 
-    componentsFound.forEach(async (component: any) => {
+    componentsFound.forEach((component: any) => {
       // Skip components without packageUrl
       if (!component.component.packageUrl) {
         core.debug(`Skipping component detected without packageUrl: ${JSON.stringify({
@@ -98,97 +136,91 @@ export default class ComponentDetection {
         return;
       }
 
-      if (!packageCache.hasPackage(packageUrl)) {
-        const pkg = new ComponentDetectionPackage(packageUrl, component.component.id,
-          component.isDevelopmentDependency, component.topLevelReferrers, component.locationsFoundAt, component.containerDetailIds, component.containerLayerIds);
-        packageCache.addPackage(pkg);
-        packages.push(pkg);
+      packagesById.set(
+        component.component.id,
+        new ComponentDetectionPackage(
+          packageUrl,
+          component.component.id,
+          component.isDevelopmentDependency
+        )
+      );
+    });
+
+    return this.createManifests(packagesById, dependencyGraphs);
+  }
+
+  private static createManifests(
+    packageDefinitionsById: Map<string, ComponentDetectionPackage>,
+    dependencyGraphs: DependencyGraphs
+  ): Manifest[] {
+    return Object.entries(dependencyGraphs)
+      .filter(([location]) => !ComponentDetection.isInstalledNpmManifest(location))
+      .map(([location, dependencyGraph]) => {
+      const manifest = new Manifest(location, location);
+      const manifestPackagesById: Map<string, ComponentDetectionPackage> = new Map();
+
+      for (const componentId of Object.keys(dependencyGraph.graph)) {
+        const packageDefinition = packageDefinitionsById.get(componentId);
+        if (!packageDefinition) {
+          core.warning(`No package found for component in dependency graph ${location}: ${componentId}`);
+          continue;
+        }
+
+        manifestPackagesById.set(
+          componentId,
+          new ComponentDetectionPackage(
+            packageDefinition.packageUrlString,
+            packageDefinition.id,
+            packageDefinition.isDevelopmentDependency
+          )
+        );
       }
-    });
 
-    // Set the transitive dependencies
-    core.debug("Sorting out transitive dependencies");
-    packages.forEach(async (pkg: ComponentDetectionPackage) => {
-      pkg.topLevelReferrers.forEach(async (referrer: any) => {
-        // Skip if referrer doesn't have a valid packageUrl
-        if (!referrer.packageUrl) {
-          core.debug(`Skipping referrer without packageUrl for component: ${pkg.id}`);
-          return;
+      for (const [componentId, dependencyIds] of Object.entries(dependencyGraph.graph)) {
+        const pkg = manifestPackagesById.get(componentId);
+        if (!pkg || !dependencyIds) {
+          continue;
         }
 
-        const referrerUrl = ComponentDetection.makePackageUrl(referrer.packageUrl);
-        referrer.packageUrlString = referrerUrl
-
-        // Skip if the generated packageUrl is empty
-        if (!referrerUrl) {
-          core.debug(`Skipping referrer with invalid packageUrl for component: ${pkg.id}`);
-          return;
-        }
-
-        try {
-          const referrerPackage = packageCache.lookupPackage(referrerUrl);
-          if (referrerPackage === pkg) {
-            core.debug(`Skipping self-reference for package: ${pkg.id}`);
-            return; // Skip self-references
+        for (const dependencyId of dependencyIds) {
+          const dependency = manifestPackagesById.get(dependencyId);
+          if (dependency && dependency !== pkg) {
+            pkg.dependsOn(dependency);
           }
-          if (referrerPackage) {
-            referrerPackage.dependsOn(pkg);
-          }
-        } catch (error) {
-          core.debug(`Error looking up referrer package: ${error}`);
         }
-      });
-    });
+      }
 
-    // Create manifests
-    const manifests: Array<Manifest> = [];
-
-    // Check the locationsFoundAt for every package and add each as a manifest
-    this.addPackagesToManifests(packages, manifests, dependencyGraphs);
-
-    return manifests;
-  }
-
-  private static addPackagesToManifests(packages: Array<ComponentDetectionPackage>, manifests: Array<Manifest>, dependencyGraphs: DependencyGraphs): void {
-    packages.forEach((pkg: ComponentDetectionPackage) => {
-      pkg.locationsFoundAt.forEach((location: any) => {
-        // Use the normalized path (remove leading slash if present)
-        let normalizedLocation = location.startsWith('/') ? location.substring(1) : location;
-        // Unescape the path, as upstream ComponentDetection emits locationsFoundAt in URL-encoded form
-        normalizedLocation = decodeURIComponent(normalizedLocation);
-
-        if (!manifests.find((manifest: Manifest) => manifest.name == normalizedLocation)) {
-          const manifest = new Manifest(normalizedLocation, normalizedLocation);
-          manifests.push(manifest);
-        }
-
-        const depGraphEntry = dependencyGraphs[normalizedLocation];
-        if (!depGraphEntry) {
-          core.warning(`No dependency graph entry found for manifest location: ${normalizedLocation}`);
-          return; // Skip this location if not found in dependencyGraphs
-        }
-
-        const directDependencies = depGraphEntry.explicitlyReferencedComponentIds;
-        if (directDependencies.includes(pkg.id)) {
-          manifests
-            .find((manifest: Manifest) => manifest.name == normalizedLocation)
-            ?.addDirectDependency(
-              pkg,
-              ComponentDetection.getDependencyScope(pkg)
-            );
+      const directDependencies = new Set(dependencyGraph.explicitlyReferencedComponentIds);
+      for (const [componentId, pkg] of manifestPackagesById) {
+        const scope = ComponentDetection.getDependencyScope(pkg, componentId, dependencyGraph);
+        if (directDependencies.has(componentId)) {
+          manifest.addDirectDependency(pkg, scope);
         } else {
-          manifests
-            .find((manifest: Manifest) => manifest.name == normalizedLocation)
-            ?.addIndirectDependency(
-              pkg,
-              ComponentDetection.getDependencyScope(pkg)
-            );
+          manifest.addIndirectDependency(pkg, scope);
         }
-      });
+      }
+
+      return manifest;
     });
   }
 
-  private static getDependencyScope(pkg: ComponentDetectionPackage) {
+  private static isInstalledNpmManifest(location: string): boolean {
+    return location.replace(/\\/g, '/').split('/').includes('node_modules');
+  }
+
+  private static getDependencyScope(
+    pkg: ComponentDetectionPackage,
+    componentId: string,
+    dependencyGraph: DependencyGraph
+  ) {
+    if (dependencyGraph.dependencies.includes(componentId)) {
+      return 'runtime';
+    }
+
+    if (dependencyGraph.developmentDependencies.includes(componentId)) {
+      return 'development';
+    }
+
     return pkg.isDevelopmentDependency ? 'development' : 'runtime'
   }
 
@@ -240,7 +272,8 @@ export default class ComponentDetection {
     if (ghesMode) {
       githubToken = "";
     }
-    const octokit = new Octokit({ auth: githubToken, baseUrl: githubAPIURL, request: { fetch: fetch}, log: {
+    // Keep retries in the acquisition loop so each run makes at most three attempts.
+    const octokit = new Octokit({ auth: githubToken, baseUrl: githubAPIURL, request: { fetch: this.fetchWithProxy}, retry: { enabled: false }, throttle: { enabled: false }, log: {
       debug: core.debug,
       info: core.info,
       warn: core.warning,
@@ -251,41 +284,35 @@ export default class ComponentDetection {
     const repo = "component-detection";
     core.debug("Attempting to download latest release from " + githubAPIURL);
 
-    try {
-      const latestRelease = await octokit.request("GET /repos/{owner}/{repo}/releases/latest", {owner, repo});
-
-    var downloadURL: string = "";
+    const latestRelease = await octokit.request("GET /repos/{owner}/{repo}/releases/latest", {owner, repo});
     const assetName = process.platform === "win32" ? "component-detection-win-x64.exe" : "component-detection-linux-x64";
-    latestRelease.data.assets.forEach((asset: any) => {
-      if (asset.name === assetName) {
-        downloadURL = asset.browser_download_url;
-      }
-    });
-
-    return downloadURL;
-    } catch (error: any) {
-      core.error(error);
-      core.debug(error.message);
-      core.debug(error.stack);
-      throw new Error("Failed to download latest release");
+    const asset = latestRelease.data.assets.find((asset) => asset.name === assetName);
+    if (!asset) {
+      throw new Error(`No Component Detection release asset named ${assetName}`);
     }
+    return asset.browser_download_url;
+  }
+
+  private static async fetchWithProxy(url: string | URL, options?: UndiciRequestInit) : Promise<UndiciResponse> {
+    return undiciFetch(url, {
+      ...options,
+      dispatcher: proxyAgent
+    });
   }
 
   /**
-   * Normalizes the keys of a DependencyGraphs object to be relative paths from the resolved filePath input.
+   * Normalizes dependency graph paths relative to the repository workspace.
    * @param dependencyGraphs The DependencyGraphs object to normalize.
-   * @param filePathInput The filePath input (relative or absolute) from the action configuration.
+   * @param repositoryRoot The repository workspace path.
    * @returns A new DependencyGraphs object with relative path keys.
    */
   public static normalizeDependencyGraphPaths(
     dependencyGraphs: DependencyGraphs,
-    filePathInput: string
+    repositoryRoot: string = process.env.GITHUB_WORKSPACE || process.cwd()
   ): DependencyGraphs {
-    // Resolve the base directory from filePathInput (relative to cwd if not absolute)
-    const baseDir = path.resolve(process.cwd(), filePathInput);
+    const baseDir = path.resolve(repositoryRoot);
     const normalized: DependencyGraphs = {};
     for (const absPath in dependencyGraphs) {
-      // Make the path relative to the baseDir
       let relPath = path.relative(baseDir, absPath).replace(/\\/g, '/');
       normalized[relPath] = dependencyGraphs[absPath];
     }
@@ -296,8 +323,7 @@ export default class ComponentDetection {
 class ComponentDetectionPackage extends Package {
   public packageUrlString: string;
 
-  constructor(packageUrl: string, public id: string, public isDevelopmentDependency: boolean, public topLevelReferrers: [],
-    public locationsFoundAt: [], public containerDetailIds: [], public containerLayerIds: []) {
+  constructor(packageUrl: string, public id: string, public isDevelopmentDependency: boolean) {
     super(packageUrl);
     this.packageUrlString = packageUrl;
   }
@@ -329,12 +355,6 @@ export type DependencyGraph = {
  * The top-level dependencyGraphs object: keys are manifest file paths, values are DependencyGraph objects
  */
 export type DependencyGraphs = Record<string, DependencyGraph>;
-
-
-
-
-
-
 
 
 
